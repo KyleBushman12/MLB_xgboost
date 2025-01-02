@@ -1,0 +1,419 @@
+#import necessary libraries
+library(tidyverse)
+library(rvest)
+library(xml2)
+library(stringi)
+library(magrittr)
+library(xgboost)
+library(Matrix)
+library(readxl)
+library(mlbplotR)
+
+#read data and get necessary variables
+gamelogs <- read.csv("~/Downloads/Baseball/Pythagoras/gamelogs_since_1995.csv")
+
+gamelogs <- gamelogs |>
+  select(RunsAllowed, BA, OBP, SLG, IP, P.BA, P.OBP, P.SLG, BP.ERA, BP.WHIP,
+         BP.BA)
+
+#remove missing data
+gamelogs <- na.omit(gamelogs)
+
+#remove outliers
+gamelogs <- gamelogs |>
+  filter(RunsAllowed <= 10)
+
+#find boundaries for acceptable BA
+high.BA <- mean(gamelogs$P.BA) + 2*sd(gamelogs$P.BA)
+low.BA <- mean(gamelogs$P.BA) - 2*sd(gamelogs$P.BA)
+
+#find boundaries for acceptable OBP
+high.OBP <- mean(gamelogs$P.OBP) + 2*sd(gamelogs$P.OBP)
+low.OBP <- mean(gamelogs$P.OBP) - 2*sd(gamelogs$P.OBP)
+
+#find boundaries for acceptable SLG
+high.SLG <- mean(gamelogs$P.SLG) + 2*sd(gamelogs$P.SLG)
+low.SLG <- mean(gamelogs$P.SLG) - 2*sd(gamelogs$P.SLG)
+
+#remove outlier BA
+gamelogs <- gamelogs |>
+  filter(P.BA <= high.BA & P.BA >= low.BA)
+
+#remove outlier OBP
+gamelogs <- gamelogs |>
+  filter(P.OBP <= high.OBP & P.OBP >= low.OBP)
+
+#remove outlier SLG
+gamelogs <- gamelogs |>
+  filter(P.SLG <= high.SLG & P.SLG >= low.SLG)
+
+#set random seed
+set.seed(123)
+
+#split data into train and test
+ind <- sample(2, nrow(gamelogs), replace = T, prob = c(0.9, 0.1))
+train <- gamelogs[ind == "1", ]
+test <- gamelogs[ind == "2", ]
+
+#build Training matrix
+Training <- sparse.model.matrix(RunsAllowed ~ .,
+                                data = train) 
+
+train_label <- train[,"RunsAllowed"]
+
+train_matrix <- xgb.DMatrix(data = as.matrix(Training),
+                            label = as.numeric(train_label))
+
+#build Testing matrix
+Testing <- sparse.model.matrix(RunsAllowed ~ .,
+                                data = test)
+
+test_label <- test[,"RunsAllowed"]
+
+test_matrix <- xgb.DMatrix(data = as.matrix(Testing),
+                           label = as.numeric(test_label))
+
+#set watchlist
+watchlist <- list(train = train_matrix, test = test_matrix)
+
+#build pythagoras boosting model
+pythagoras <- xgb.train(data = train_matrix,
+                    eta=0.01,
+                    max.depth=2,
+                    nrounds=1150,
+                   watchlist = watchlist,
+                   nthread=4,
+                   objective="reg:squarederror",
+                   verbose=FALSE,
+                   eval_metric="rmse")
+
+#error plot
+e <- data.frame(pythagoras$evaluation_log)
+plot(x=e$iter, y=e$test_rmse, col = 'blue')
+lines(e$iter, e$train_rmse, col = 'red')
+
+#find most important variables
+importance_matrix = xgb.importance(colnames(train_label), model = pythagoras)
+
+sorted_values <- importance_matrix[order(importance_matrix$Gain, decreasing = TRUE)]
+
+ggplot(sorted_values, aes(y=reorder(Feature, Gain), x=Gain))+
+  geom_bar(stat='identity', aes(fill=Gain))+
+  labs(x="Importance", y="Feature", title="XGBoost Variable Importance")+
+  theme_minimal()
+
+#read in prediction data
+pred_stats <- read.csv("~/pythagoras_prediction_set.csv")
+
+#read in stats for today
+daily_stats <- read.csv("~/pythagoras_daily_stats.csv")
+
+#make sure stats are numeric
+pred_stats <- sapply(pred_stats, as.numeric)
+
+#make sure pred_stats is formatted exactly the same as gamelogs (sometimes causes issues, this first row will be immediately removed)
+pred_stats <- rbind(gamelogs[1,], pred_stats)
+
+#remove previously attached row
+pred_stats <- pred_stats[-1,]
+
+#build prediction matrix
+pred.stats <- sparse.model.matrix(RunsAllowed ~ .,
+                                data = pred_stats)
+
+pred_label <- pred_stats[,"RunsAllowed"]
+
+pred_matrix <- xgb.DMatrix(data = as.matrix(pred.stats),
+                           label = as.numeric(pred_label))
+
+#predict using pythagoras
+predictions <- predict(pythagoras, pred_matrix)
+
+predictions <- data.frame(predictions)
+
+#set 'RPG' column as the prected runs per game
+daily_stats$RPG <- predictions$predictions
+
+#set matchups to numeric type
+daily_stats$Matchup <- as.numeric(daily_stats$Matchup)
+
+#order daily_stats by Matchup
+daily_stats <- daily_stats[order(daily_stats$Matchup),]
+
+#separate the teams into home and away
+visTeams <- daily_stats |>
+  filter(Home.Away == "V")
+
+homeTeams <- daily_stats |>
+  filter(Home.Away == "H")
+
+#the 'RPG' variable is the prediction for the offense, daily stats are defensive, so the home and away need to swap 'RPG' to make precedent
+filler <- visTeams$RPG
+
+visTeams$RPG <- homeTeams$RPG
+
+homeTeams$RPG <- filler
+
+#calculate probability of winning based on predicted RPG
+visTeams$pyth <- (visTeams$RPG**1.83)/(homeTeams$RPG**1.83 +
+                                         visTeams$RPG**1.83)
+
+homeTeams$pyth <- (homeTeams$RPG**1.83)/(visTeams$RPG**1.83 +
+                                         homeTeams$RPG**1.83)
+
+#create a variable to use for sorting later
+visTeams$sort <- seq(1, 2*nrow(visTeams), by = 2)
+homeTeams$sort <- seq(2, 2*nrow(homeTeams), by = 2)
+
+#combine home and away back together
+Report <- rbind(visTeams, homeTeams)
+
+#sort them in order
+Report <- Report[order(Report$sort),]
+
+#keep wanted variables
+Report <- Report |>
+  select(Matchup, Team, Short, Name, RPG, pyth)
+
+#rename the 'pyth' column as 'win%' to be more descriptive
+colnames(Report)[6] <- "Win%"
+
+#round for easy evaluation
+Report$`Win%` <- round(Report$`Win%`, 2)
+
+#make sure 'Moneyline' is numeric
+daily_stats$Moneyline <- as.numeric(daily_stats$Moneyline)
+
+#odds conversion for Moneyline
+daily_stats$xWin <- 0
+
+for(i in 1:nrow(daily_stats)){
+  if(daily_stats[i,]$Moneyline < 0){
+    daily_stats$xWin[i] <- ((-1)*(daily_stats[i,]$Moneyline))/((-1)*(daily_stats[i,]$Moneyline) + 100)
+  }
+  else if(daily_stats[i,]$Moneyline > 0){
+    daily_stats$xWin[i] <- 100/(daily_stats[i,]$Moneyline+100)
+  }
+}
+
+#keep 'xWin' in an easy format to join later
+need <- daily_stats |>
+  select(Team, xWin)
+
+#make sure 'RL.Odds' is numeric
+daily_stats$RL.Odds <- as.numeric(daily_stats$RL.Odds)
+
+#odds conversion for RL
+daily_stats$xRL <- 0
+
+for(i in 1:nrow(daily_stats)){
+  if(daily_stats[i,]$RL.Odds < 0){
+    daily_stats$xRL[i] <- ((-1)*(daily_stats[i,]$RL.Odds))/((-1)*(daily_stats[i,]$RL.Odds) + 100)
+  }
+  else if(daily_stats[i,]$RL.Odds > 0){
+    daily_stats$xRL[i] <- 100/(daily_stats[i,]$RL.Odds+100)
+  }
+}
+
+#keep 'xRL' in an easy format to join later
+need2 <- daily_stats |>
+  select(Team, xRL)
+
+#add 'xWin' and 'xRL' to the report data
+Report <- left_join(Report, need, by = "Team")
+
+Report <- left_join(Report, need2, by = "Team")
+
+#calculate difference between vegas odds and calculated odds
+Report$Advantage <- Report$`Win%` - Report$xWin
+
+#order by matchups
+daily_stats <- daily_stats %>%
+  arrange(Matchup, desc(Home.Away))
+
+#read in previous results
+results <- read_xlsx("~/PythagorasResults.xlsx")
+
+#remove rows where scores are not recorded
+results <- results |>
+  filter(is.na(Score) == FALSE)
+
+#keep wanted variables
+results <- results |>
+  select(Short, RPG, Score)
+
+#create a new variable for the opponenet's RPG
+results$O.RPG <- NA
+
+for(i in 1:nrow(results)){
+  if(i %% 2 == 1){
+    results$O.RPG[i] <- results$RPG[i+1]
+  }
+  else if(i %% 2 == 0){
+    results$O.RPG[i] <- results$RPG[i-1]
+  }
+}
+results <- results |>
+  select(Short, RPG, O.RPG, Score)
+
+#create a new variable for the opponenet's score
+results$O.Score <- NA
+
+for(i in 1:nrow(results)){
+  if(i %% 2 == 1){
+    results$O.Score[i] <- results$Score[i+1]
+  }
+  else if(i %% 2 == 0){
+    results$O.Score[i] <- results$Score[i-1]
+  }
+}
+
+#check if each team won by 2
+results$Win_by_2 <- ifelse((results$Score - results$O.Score) > 1, 1, 0)
+
+#fit logistic regression to predict run lines
+RL.mod <- glm(Win_by_2 ~ RPG + O.RPG + RPG*O.RPG, data = results, family = binomial)
+
+#create a dat frame for run line data
+RL.data <- Report |>
+  select(Team, RPG)
+
+#create a variable for opponent RPG
+RL.data$O.RPG <- NA
+
+for(i in 1:nrow(RL.data)){
+  if(i %% 2 == 1){
+    RL.data$O.RPG[i] <- RL.data$RPG[i+1]
+  }
+  else if(i %% 2 == 0){
+    RL.data$O.RPG[i] <- RL.data$RPG[i-1]
+  }
+}
+
+#predict using the run line model
+RL.data$RL.2 <- predict(RL.mod, RL.data, type = "response")
+
+#check if a team "covers" the run line (lose by less than 2 or win)
+results$Cover <- ifelse((results$Score - results$O.Score) > -2, 1, 0)
+
+#fit a logistic regression to predict if a team will "cover"
+Cover.mod <- glm(Cover ~ RPG + O.RPG + RPG*O.RPG, data = results, family = binomial)
+
+#predict using the cover model
+RL.data$RL.cover <- predict(Cover.mod, RL.data, type = "response")
+
+#create a data set to hold the set run lines
+lines <- daily_stats |>
+  select(Team, RL)
+
+#join those run lines into the RL.data set
+RL.data <- left_join(RL.data, lines, by = "Team")
+
+#add variable for run line probability, given the team's line is set at -1.5 or +1.5
+RL.data$`RL%` <- ifelse(RL.data$RL > 0, RL.data$RL.cover, RL.data$RL.2)
+
+#remove the set lines
+RL.data <- RL.data |>
+  select(Team, `RL%`)
+
+#change column name of 'RL%' to 'RL'
+Report <- Report |>
+  mutate(RL = RL.data$`RL%`)
+
+#choose wanted columns and add a column for the difference between the vegas RL odds and calculated RL odds
+Report <- Report |>
+  select(Matchup, Team, Short, Name, RPG, `Win%`, xWin, RL, xRL, Advantage) |>
+  mutate(Adv.RL = RL - xRL)
+
+#add the set lines to the report data
+Report$Line <- daily_stats$RL
+
+#Round data to 3 places for easy evaluation
+Report <- Report |>
+  mutate(
+    RPG = round(RPG, 3),
+    xWin = round(xWin,3),
+    RL = round(RL,3),
+    xRL = round(xRL,3),
+    Adv = round(Advantage, 5),
+    Adv.RL = round(Adv.RL, 5)) |>
+  select(-Advantage)
+
+#keep wanted variables
+Report <- Report |>
+  select(Matchup, Team, Short, Name, RPG, `Win%`, xWin, RL, xRL, Adv, Adv.RL, Line)
+
+#create a data set for only positive Moneyline estimations
+Report_Positive <- Report |>
+  filter(Adv > 0)
+
+#create a data set for only positive RL estimations
+Report_Positive.RL <- Report |>
+  filter(Adv.RL > 0)
+
+#remove full team names
+Report <- Report |>
+  select(-Team)
+
+#print report
+knitr::kable(Report)
+
+#print plot of positive Moneylines
+Plot.ML <- ggplot(Report_Positive, aes(x=Short, y=Adv))+
+  geom_hline(yintercept=max(Report$Adv), color="purple")+
+  geom_hline(yintercept=0.05, color="blue")+
+  geom_mlb_logos(aes(team_abbr = Short), width=0.05)+
+  ylab("ML Advantage")+
+  xlab("Team")+
+  ggtitle("Pythagoras ML")+
+  geom_hline(yintercept=0, color="red")
+
+Plot.ML
+
+#print plot of positive RL
+Plot.RL <- ggplot(Report_Positive.RL, aes(x=Short, y=Adv.RL))+
+  geom_hline(yintercept=max(Report$Adv.RL), color="purple")+
+  geom_hline(yintercept=0.05, color="blue")+
+  geom_mlb_logos(aes(team_abbr = Short), width=0.05)+
+  ylab("RL Advantage")+
+  xlab("Team")+
+  ggtitle("Pythagoras RL")+
+  geom_hline(yintercept=0, color="red")
+
+Plot.RL
+
+#display starter data
+starter_report <- daily_stats |>
+  select(Name, P.BA, P.OBP, P.SLG, IP) |>
+  arrange(Name) |>
+  mutate(
+    P.BA = round(P.BA, 3),
+    P.OBP = round(P.OBP, 3),
+    P.SLG = round(P.SLG, 3)
+  )
+
+knitr::kable(starter_report)
+
+#display batting data
+batter_report <- daily_stats |>
+  select(Short, BA, OBP, SLG) |>
+  arrange(Short) |>
+  mutate(
+    BA = round(BA, 3),
+    OBP = round(OBP, 3),
+    SLG = round(SLG, 3)
+  )
+
+knitr::kable(batter_report)
+
+#display reliever data
+reliever_report <- daily_stats |>
+  select(Short, BP.ERA, BP.WHIP, BP.BA) |>
+  arrange(Short) |>
+  mutate(
+    BP.ERA = round(BP.ERA, 3),
+    BP.WHIP = round(BP.WHIP, 3),
+    BP.BA = round(BP.BA, 3)
+  )
+
+knitr::kable(reliever_report)
